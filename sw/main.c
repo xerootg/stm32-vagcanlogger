@@ -13,6 +13,8 @@
 #include "filesystem/diskio.h"
 #include "filesystem/ff.h"
 
+#define UART1_DEBUG 1
+
 vu16 timer1 = 0;
 vu16 timer2 = 0;
 vu16 timerKW = 0;
@@ -245,13 +247,13 @@ void Timer3Init()
 }
 
 
-u16 KW1281_SPEED=0; //autobaud
 u8 autobaud = 1;
 u8 user_defined_timings = 0;
 u8 canDiag = 0;
 
 int main(void)
 {
+  #pragma region init
   FIL log_file;
   int i, j, result;
   int file_number = 0;
@@ -265,6 +267,7 @@ int main(void)
   debug();
 #endif
 
+  // hardware init for flash, timers, and misc clocks
   RCC_Configuration();
   GPIO_Configuration();
   NVIC_Configuration();
@@ -291,7 +294,7 @@ int main(void)
   GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
   GPIO_Init(GPIOA, &GPIO_InitStructure);
 #endif
-
+  // init MMC (SD Card)
   MMC_PowerOff();
   timer2=1000;
   while(timer2);
@@ -301,33 +304,32 @@ int main(void)
   printf("\n\n%s %s\n", HW_VERSION, SW_VERSION);
 #endif
 
+  // setup RTC
   ConfigureClock();
   timer2=1000;
   while(timer2);
 
   buttonState = 0;
 
+  //set the "card inserted" flag in the SD driver
   CardInserted();
   
+  //If the SD card isnt inserted, set the LED, make a beep, and 
   if (FR_OK != f_mount(0, &Fatfs[0]))
   {
-    LedSetColor(amber, fast);
-    BuzzerSetMode(0x83);
-#ifdef UART1_DEBUG
     printf("error mounting fat device\n");
-#endif
     while(buttonState != 2);
     NVIC_GenerateSystemReset();
   }
 
+  // set the time (RTC) based off a file in the root of the SD card
   if (ReadTimeDateFile())
   {
-#ifdef UART1_DEBUG
     rawtime = RTC_GetCounter();
     printf("Time set: %s\n", ctime (&rawtime) );
-#endif
   }
 
+// if DEBUG.TXT exists on the SD card, set debugState = 1
 #ifdef DEBUG_LOG
   if (ReadDebugFile())
   {
@@ -335,38 +337,21 @@ int main(void)
   }
 #endif
 
-#ifdef CAN_FEATURE_ENABLED
-  if (ReadCanFile())
-  {
-    canDiag = 1;
-    CAN_Open();
-  }
-#endif
+// if CAN.TXT exists, INIT can.
 
-  i = ReadSpeedFile();
-  if (i > 0)
-  {
-    KW1281_SPEED = i;
-    autobaud = 0;
-  }
+  CAN_Open();
 
-  if (ReadDelayFile())
-  {
-    user_defined_timings = 1;
-  }
   
+  // get config.txt. If its missing, set Error LED, beep, power off the SD card, and reboot when button is pressed.
   if (!ReadConfig())
   {
-    LedSetColor(amber, fast); 
-    BuzzerSetMode(0x83);
-#ifdef UART1_DEBUG
     printf("error reading config\n");
-#endif
     MMC_PowerOff();
     while(buttonState != 2);
     NVIC_GenerateSystemReset(); 
   }
   
+  // if the config has values, set maxConfig(?) else, set error LED, beep, power off the SD card, and reboot on buttonState 2
   if (config[0][0] > 0)
   {
     maxConfig = 1;
@@ -381,52 +366,41 @@ int main(void)
   }
   else
   {
-    LedSetColor(amber, fast); 
-    BuzzerSetMode(0x83);
-#ifdef UART1_DEBUG
     printf("error reading config\n");
-#endif
     MMC_PowerOff();
     while(buttonState != 2);
     NVIC_GenerateSystemReset(); 
   }
 
+  // walk the FS, and find an unused file name, i.e. 1. 
+  //returns: 0 - error
+  //returns 1-999 - first free file number
   file_number = GetNextFileNumber();
-#ifdef UART1_DEBUG
   printf("file number %d\n", file_number);
-#endif
+
+  // if a filenumber fails to be set (i.e. file_number == 0), error LED, beep, SD shutdown, and reset on button press
   if (!file_number)
   {
-    LedSetColor(amber, fast); 
-    BuzzerSetMode(0x83);
-#ifdef UART1_DEBUG
     printf("can't get number of next file\n");
-#endif
     MMC_PowerOff();
     while(buttonState != 2);
     NVIC_GenerateSystemReset(); 
   }
-  
+  #pragma endregion init
+  // INIT OVER!!!
   while(1)
   {
-    i = USART2_GetData();
     buttonState = 0;
-    LedSetColor(configNumber, continous);
-    BuzzerSetMode(configNumber);
     do
     {
       if (2 == buttonState)
       {
         configNumber = (configNumber < maxConfig)?configNumber+1:1;
-        LedSetColor(configNumber, continous);
-        BuzzerSetMode(configNumber);
         buttonState = 0;
       }
     } while (1 != buttonState);
     
     buttonState = 0;
-    LedSetColor(green, fast);
-    BuzzerSetMode(0x81);
 
     i = CreateLogFile(file_number, &log_file);
 
@@ -438,124 +412,40 @@ int main(void)
     timeSec = 0;
     time10MSec = 0;
     
-    if (canDiag)
-    {
-      i = f_printf(&log_file, "CAN 500kbit\n\n");
-      LedSetColor(configNumber, slow);
-      BuzzerSetMode(configNumber);
-      result = vwtp(&config[configNumber-1], &log_file, debugState);
-      
-      switch (result)
-      {
-        case 0:
-          timer2 = 500;
-          i = f_printf(&log_file, "\n\nLogging terminated by user\n");
-          break;
-        
-        case 1:
-          LedSetColor(red, fast);
-          BuzzerSetMode(0x82); //communication error
-          timer2 = 2000;
-          i = f_printf(&log_file, "\n\nConnection lost\n");
-          break;
-          
-        case 2:
-          i = CloseLogFile(&log_file);
-          LedSetColor(amber, fast);
-          BuzzerSetMode(0x83); //filesystem error
-          MMC_PowerOff();
-          while(buttonState != 2);
-          NVIC_GenerateSystemReset();  
-          break;
-        
-        case 11:
-          LedSetColor(red, fast);
-          BuzzerSetMode(0x82); //communication error
-          timer2 = 2000;
-          i = f_printf(&log_file, "\n\nCannot connect with ECU\n", result);
-          break;
-
-        default:
-          LedSetColor(red, fast);
-          BuzzerSetMode(0x82); //communication error
-          timer2 = 2000;
-          i = f_printf(&log_file, "\n\nCommunication error, error code = %d\n", result);
-          break;
-      }
-    } 
-    else //KW1281 diag
-    {
-      i = kw1281_max_init_attempts;
-      do
-      {
-        result = ISO9141Init(&KW1281_SPEED);
-
-        --i;
-        if ((result>0) && (i>0))
-        {
-          timer2=1000;
-          while(timer2);
-        }
-      } while (result && i);
-
-      if (0 == result) //connected with ECU
-      {
-        i = f_printf(&log_file, "Connected @ %d baud %s%s\n\n", KW1281_SPEED, autobaud?"(autodetected)":"(set by user)", user_defined_timings?", user defined timings":"");
-        LedSetColor(configNumber, slow);
-        BuzzerSetMode(configNumber);
+    #pragma region logger
+    i = f_printf(&log_file, "CAN 500kbit\n\n");
+    result = vwtp(&config[configNumber-1], &log_file, debugState);
     
-        buttonState = 0;
-        i = kw1281_diag(&config[configNumber-1], &log_file, debugState);
+    switch (result)
+    {
+      case 0:
+        timer2 = 500;
+        i = f_printf(&log_file, "\n\nLogging terminated by user\n");
+        break;
       
-        switch (i)
-        {
-          case 0:
-            timer2 = 500;
-            i = f_printf(&log_file, "\n\nLogging terminated by user\n");
-            break;
-        
-          case 1:
-            LedSetColor(red, fast);
-            BuzzerSetMode(0x82); //communication error
-            timer2 = 2000;
-            i = f_printf(&log_file, "\n\nConnection lost\n");
-            break;
-          
-          case 2:
-          default:
-            i = CloseLogFile(&log_file);
-            LedSetColor(amber, fast);
-            BuzzerSetMode(0x83); //filesystem error
-            MMC_PowerOff();
-            while(buttonState != 2);
-            NVIC_GenerateSystemReset();  
-        }
-      }
-      if (0 != result)
-      {
-        i = f_printf(&log_file, "Cannot connect with ECU: ");
-        if (0xff == result)
-        {
-          i = f_printf(&log_file, "no response\n");
-        }
-        else if (0x7f == result)
-        {
-          i = f_printf(&log_file, "sync error - wrong speed (set to %d baud)?!\n", KW1281_SPEED);
-        }
-        else if (0x10 == result)
-        {
-          i = f_printf(&log_file, "not a KW1281 protocol\n");
-        }
-        else
-        {
-          i = f_printf(&log_file, "error code %d\n", result);
-        }
-        LedSetColor(red, fast); 
-        BuzzerSetMode(0x82);
+      case 1:
         timer2 = 2000;
-      }
-    } // end of KW1281 diag
+        i = f_printf(&log_file, "\n\nConnection lost\n");
+        break;
+        
+      case 2:
+        i = CloseLogFile(&log_file);
+        MMC_PowerOff();
+        while(buttonState != 2);
+        NVIC_GenerateSystemReset();  
+        break;
+      
+      case 11:
+        timer2 = 2000;
+        i = f_printf(&log_file, "\n\nCannot connect with ECU\n", result);
+        break;
 
+      default:
+        timer2 = 2000;
+        i = f_printf(&log_file, "\n\nCommunication error, error code = %d\n", result);
+        break;
+    }
+    #pragma endregion logger
     i = CloseLogFile(&log_file);
     file_number++;
     while (timer2>0);
